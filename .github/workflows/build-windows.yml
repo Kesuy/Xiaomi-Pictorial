@@ -38,6 +38,12 @@ jobs:
           pip install pillow
           python tools/probe_api.py
 
+      - name: Upload September 22 server image
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-2026-09-22
+          path: server_2026-09-22_1080.webp
+
   build:
     needs: test
     runs-on: windows-latest
