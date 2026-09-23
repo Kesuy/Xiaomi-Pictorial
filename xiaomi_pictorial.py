@@ -20,7 +20,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 APP_NAME = "Xiaomi Pictorial"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 API_HOST = "https://w.pandora.xiaomi.com"
 API_PREFIX = "/api/a1"
@@ -32,7 +32,19 @@ DEFAULT_VERSION_CODE = 2025200033
 DEFAULT_FEATURE_VERSION = "20160831"
 DEFAULT_PAGE_SIZE = 30
 DEFAULT_DELTA = 6
-DEFAULT_WIDTH = 1440
+DEFAULT_WIDTH = 2160
+
+FILENAME_FORMATS = {
+    "date": "日期",
+    "title": "标题",
+    "date_title": "日期+标题",
+}
+QUALITY_OPTIONS = {
+    "best": "最高可用",
+    "2160": "2160 优先",
+    "1440": "1440 优先",
+    "1080": "1080 优先",
+}
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
 
@@ -52,6 +64,7 @@ class MorningRecord:
     title: str
     description: str
     image_url: str
+    image_candidates: list[str]
     raw: dict[str, Any]
 
 
@@ -147,6 +160,54 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def dedupe_keep_order(items: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        item = (item or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def width_from_url(url: str) -> int:
+    match = re.search(r"/w(\\d{3,5})/", url)
+    return int(match.group(1)) if match else 0
+
+
+def reorder_candidates(candidates: list[str], quality_mode: str) -> list[str]:
+    if quality_mode == "best":
+        # url_full/url_h remain first; generated CDN widths are then ordered high -> low.
+        fixed = [u for u in candidates if width_from_url(u) == 0]
+        resized = sorted(
+            [u for u in candidates if width_from_url(u) > 0],
+            key=width_from_url,
+            reverse=True,
+        )
+        return fixed + resized
+    try:
+        target = int(quality_mode)
+    except ValueError:
+        return candidates
+    fixed = [u for u in candidates if width_from_url(u) == 0]
+    resized = sorted(
+        [u for u in candidates if width_from_url(u) > 0],
+        key=lambda u: (abs(width_from_url(u) - target), -width_from_url(u)),
+    )
+    return fixed + resized
+
+
+def make_base_name(record: MorningRecord, mode: str) -> str:
+    title = sanitize_filename(record.title)
+    if mode == "title" and title != "untitled":
+        return title
+    if mode == "date_title" and title != "untitled":
+        return sanitize_filename(f"{record.morning_date} {title}")
+    return record.morning_date
+
+
 def _date_from_item(item: dict[str, Any]) -> str:
     direct = item.get("morning_date") or item.get("morningDate")
     if direct:
@@ -187,53 +248,49 @@ def _https(url: str) -> str:
     return url
 
 
-def _image_url(item: dict[str, Any], width: int) -> str:
+def _image_candidates(
+    item: dict[str, Any],
+    widths: Iterable[int] = (2160, 1440, 1080),
+) -> list[str]:
     images = item.get("images")
     if not isinstance(images, list):
         images = []
 
+    cl_urls: list[dict[str, Any]] = []
     for image in images:
         if not isinstance(image, dict):
             continue
-        cl = image.get("cl_url") or image.get("clUrl") or image
-        cl = _as_dict(cl)
-        if not cl:
-            continue
+        cl = _as_dict(image.get("cl_url") or image.get("clUrl") or image)
+        if cl:
+            cl_urls.append(cl)
 
-        # 与 25200033 客户端 getHdUrl() 的优先方向保持一致。
-        for key in ("url_h", "url_full", "url_l", "url_m"):
+    top_cl = _as_dict(item.get("cl_url") or item.get("clUrl"))
+    if top_cl:
+        cl_urls.append(top_cl)
+
+    result: list[str] = []
+    for cl in cl_urls:
+        # 25200033 中能看到 url_full/url_h/url_m/url_l/url_r。
+        # 先尝试服务端直接给出的完整/高清地址，再尝试 CDN 动态宽度。
+        for key in ("url_full", "url_h", "url_m", "url_l", "url_r"):
             value = str(cl.get(key) or "").strip()
             if value:
-                return _https(value)
+                result.append(_https(value))
 
         root = str(cl.get("url_root") or "").strip()
-        locator = str(cl.get("locator") or "").strip()
+        locator = str(cl.get("locator") or "").strip().lstrip("/")
         if root and locator:
-            return (
-                _https(root).rstrip("/")
-                + f"/webp/w{int(width)}/"
-                + locator.lstrip("/")
-            )
+            root = _https(root).rstrip("/")
+            for width in widths:
+                result.append(f"{root}/webp/w{int(width)}/{locator}")
 
-    # 少量返回可能把 cl_url 放在 item 顶层。
-    cl = _as_dict(item.get("cl_url") or item.get("clUrl"))
-    if cl:
-        for key in ("url_h", "url_full", "url_l", "url_m"):
-            value = str(cl.get(key) or "").strip()
-            if value:
-                return _https(value)
-        root = str(cl.get("url_root") or "").strip()
-        locator = str(cl.get("locator") or "").strip()
-        if root and locator:
-            return (
-                _https(root).rstrip("/")
-                + f"/webp/w{int(width)}/"
-                + locator.lstrip("/")
-            )
-    return ""
+    return dedupe_keep_order(result)
 
 
-def extract_morning_records(payload: Any, width: int = DEFAULT_WIDTH) -> list[MorningRecord]:
+def extract_morning_records(
+    payload: Any,
+    widths: Iterable[int] = (2160, 1440, 1080),
+) -> list[MorningRecord]:
     result: list[MorningRecord] = []
     seen: set[tuple[str, str]] = set()
 
@@ -252,7 +309,8 @@ def extract_morning_records(payload: Any, width: int = DEFAULT_WIDTH) -> list[Mo
             or item.get("description")
             or ""
         ).strip()
-        image_url = _image_url(item, width)
+        image_candidates = _image_candidates(item, widths)
+        image_url = image_candidates[0] if image_candidates else ""
 
         key = (morning_date, item_id or image_url)
         if key in seen:
@@ -265,6 +323,7 @@ def extract_morning_records(payload: Any, width: int = DEFAULT_WIDTH) -> list[Mo
                 title=title,
                 description=description,
                 image_url=image_url,
+                image_candidates=image_candidates,
                 raw=item,
             )
         )
@@ -444,7 +503,10 @@ class XiaomiPictorialClient:
                     encoding="utf-8",
                 )
 
-            records = extract_morning_records(payload, self.width)
+            records = extract_morning_records(
+                payload,
+                (2160, 1440, 1080, self.width),
+            )
             if on_page:
                 on_page(page_no, records)
             if not records:
@@ -481,41 +543,58 @@ class XiaomiPictorialClient:
             cursor = next_cursor
             time.sleep(0.15)
 
-    def download_image(self, url: str, destination_base: Path) -> Path:
-        if not url:
+    def download_image(
+        self,
+        record: MorningRecord,
+        destination_base: Path,
+        quality_mode: str = "best",
+    ) -> tuple[Path, str]:
+        candidates = record.image_candidates or ([record.image_url] if record.image_url else [])
+        candidates = reorder_candidates(candidates, quality_mode)
+        if not candidates:
             raise XiaomiPictorialError("该条早安画报没有可用的图片地址")
 
-        try:
-            response = self.session.get(url, stream=True, timeout=45)
-        except requests.RequestException as exc:
-            raise XiaomiPictorialError(f"图片下载失败：{exc}") from exc
+        last_error = "未知错误"
+        for url in candidates:
+            try:
+                response = self.session.get(url, stream=True, timeout=45)
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                continue
 
-        if not response.ok:
-            raise XiaomiPictorialError(f"图片下载 HTTP {response.status_code}: {url}")
+            if not response.ok:
+                last_error = f"HTTP {response.status_code}: {url}"
+                response.close()
+                continue
 
-        content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
-        suffix = {
-            "image/jpeg": ".jpg",
-            "image/png": ".png",
-            "image/webp": ".webp",
-            "image/avif": ".avif",
-        }.get(content_type)
+            content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
+            suffix = {
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/webp": ".webp",
+                "image/avif": ".avif",
+            }.get(content_type)
 
-        if not suffix:
-            suffix = Path(requests.utils.urlparse(url).path).suffix.lower()
-            if suffix not in IMAGE_SUFFIXES:
-                suffix = ".jpg"
+            if not suffix:
+                suffix = Path(requests.utils.urlparse(url).path).suffix.lower()
+                if suffix not in IMAGE_SUFFIXES:
+                    suffix = ".jpg"
 
-        destination = destination_base.with_suffix(suffix)
-        tmp = destination.with_suffix(destination.suffix + ".part")
-        destination.parent.mkdir(parents=True, exist_ok=True)
+            destination = destination_base.with_suffix(suffix)
+            tmp = destination.with_suffix(destination.suffix + ".part")
+            destination.parent.mkdir(parents=True, exist_ok=True)
 
-        with tmp.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=256 * 1024):
-                if chunk:
-                    handle.write(chunk)
-        tmp.replace(destination)
-        return destination
+            try:
+                with tmp.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=256 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+                tmp.replace(destination)
+                return destination, url
+            finally:
+                response.close()
+
+        raise XiaomiPictorialError(f"图片下载失败：{last_error}")
 
 
 class MorningDownloader:
@@ -529,6 +608,8 @@ class MorningDownloader:
         save_json: bool = True,
         skip_existing: bool = True,
         dry_run: bool = False,
+        quality_mode: str = "best",
+        filename_mode: str = "date",
     ) -> None:
         self.client = client
         self.output_dir = output_dir
@@ -537,6 +618,8 @@ class MorningDownloader:
         self.save_json = save_json
         self.skip_existing = skip_existing
         self.dry_run = dry_run
+        self.quality_mode = quality_mode
+        self.filename_mode = filename_mode
 
     def _folder_for(self, record: MorningRecord) -> Path:
         if not self.organize_by_month:
@@ -597,7 +680,7 @@ class MorningDownloader:
             folder = self._folder_for(record)
             folder.mkdir(parents=True, exist_ok=True)
 
-            stem = record.morning_date
+            stem = make_base_name(record, self.filename_mode)
             if self.skip_existing and self._has_existing_image(folder, stem):
                 stats.skipped += 1
                 log(f"[跳过] {record.morning_date} 已存在")
@@ -615,9 +698,10 @@ class MorningDownloader:
                 continue
 
             try:
-                saved_image = self.client.download_image(
-                    record.image_url,
+                saved_image, selected_url = self.client.download_image(
+                    record,
                     folder / stem,
+                    self.quality_mode,
                 )
 
                 if self.save_text:
@@ -625,13 +709,14 @@ class MorningDownloader:
                         f"日期：{record.morning_date}\n"
                         f"标题：{record.title}\n"
                         f"文案：{record.description}\n"
-                        f"图片：{record.image_url}\n"
+                        f"图片：{selected_url}\n"
                         f"ID：{record.item_id}\n"
                     )
                     (folder / f"{stem}.txt").write_text(text, encoding="utf-8")
 
                 if self.save_json:
                     metadata = asdict(record)
+                    metadata["selected_image_url"] = selected_url
                     metadata["saved_image"] = saved_image.name
                     (folder / f"{stem}.json").write_text(
                         json.dumps(metadata, ensure_ascii=False, indent=2),
@@ -681,6 +766,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="覆盖 time_offset（默认使用本机 UTC 偏移秒数）",
     )
+    parser.add_argument(
+        "--quality",
+        choices=list(QUALITY_OPTIONS),
+        default="best",
+        help="图片质量策略",
+    )
+    parser.add_argument(
+        "--name-format",
+        choices=list(FILENAME_FORMATS),
+        default="date",
+        help="图片命名格式",
+    )
     parser.add_argument("--gui", action="store_true", help="打开图形界面")
     return parser
 
@@ -703,6 +800,8 @@ def run_cli(args: argparse.Namespace) -> int:
         save_json=not args.no_json,
         skip_existing=not args.overwrite,
         dry_run=args.dry_run,
+        quality_mode=args.quality,
+        filename_mode=args.name_format,
     )
 
     print(
@@ -732,28 +831,41 @@ def run_cli(args: argparse.Namespace) -> int:
 class App:
     def __init__(self) -> None:
         import tkinter as tk
-        from tkinter import filedialog, messagebox, ttk
+        from tkinter import filedialog, messagebox, scrolledtext, ttk
 
         self.tk = tk
         self.ttk = ttk
         self.filedialog = filedialog
         self.messagebox = messagebox
+        self.scrolledtext = scrolledtext
 
-        self.root = tk.Tk()
+        try:
+            import ttkbootstrap as tb
+            self.tb = tb
+            self.root = tb.Window(themename="flatly")
+            self.use_bootstrap = True
+        except Exception:
+            self.tb = None
+            self.root = tk.Tk()
+            self.use_bootstrap = False
+
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        self.root.geometry("820x650")
-        self.root.minsize(760, 580)
+        self.root.geometry("980x760")
+        self.root.minsize(920, 700)
+        self._set_icon()
 
         self.start_var = tk.StringVar(value="")
         self.end_var = tk.StringVar(value=date.today().isoformat())
         self.output_var = tk.StringVar(value=str((_app_dir() / "downloads").resolve()))
-        self.width_var = tk.StringVar(value=str(DEFAULT_WIDTH))
+        self.quality_var = tk.StringVar(value="best")
+        self.filename_var = tk.StringVar(value="date")
         self.organize_var = tk.BooleanVar(value=True)
         self.text_var = tk.BooleanVar(value=True)
         self.json_var = tk.BooleanVar(value=True)
         self.skip_var = tk.BooleanVar(value=True)
         self.debug_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="就绪")
+        self.progress_var = tk.DoubleVar(value=0)
 
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
@@ -762,104 +874,158 @@ class App:
         self._build()
         self.root.after(100, self._flush_log_queue)
 
+    def _resource_path(self, *parts: str) -> Path:
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        return base.joinpath(*parts)
+
+    def _set_icon(self) -> None:
+        try:
+            ico = self._resource_path("assets", "app_icon.ico")
+            if ico.exists():
+                self.root.iconbitmap(default=str(ico))
+        except Exception:
+            pass
+        try:
+            png = self._resource_path("assets", "app_icon.png")
+            if png.exists():
+                self._icon_ref = self.tk.PhotoImage(file=str(png))
+                self.root.iconphoto(True, self._icon_ref)
+        except Exception:
+            pass
+
+    def _frame(self, parent, **kwargs):
+        return self.tb.Frame(parent, **kwargs) if self.use_bootstrap else self.ttk.Frame(parent, **kwargs)
+
+    def _labelframe(self, parent, text: str, **kwargs):
+        if self.use_bootstrap:
+            return self.tb.Labelframe(parent, text=text, **kwargs)
+        return self.ttk.LabelFrame(parent, text=text, **kwargs)
+
+    def _button(self, parent, text: str, command, bootstyle: str = "", **kwargs):
+        if self.use_bootstrap:
+            return self.tb.Button(parent, text=text, command=command, bootstyle=bootstyle, **kwargs)
+        return self.ttk.Button(parent, text=text, command=command, **kwargs)
+
+    def _check(self, parent, text: str, variable):
+        if self.use_bootstrap:
+            return self.tb.Checkbutton(
+                parent,
+                text=text,
+                variable=variable,
+                bootstyle="round-toggle",
+            )
+        return self.ttk.Checkbutton(parent, text=text, variable=variable)
+
+    def _combo(self, parent, variable, values):
+        widget = self.ttk.Combobox(
+            parent,
+            textvariable=variable,
+            values=values,
+            state="readonly",
+        )
+        return widget
+
     def _build(self) -> None:
         ttk = self.ttk
-        root = self.root
+        container = self._frame(self.root, padding=20)
+        container.pack(fill="both", expand=True)
 
-        outer = ttk.Frame(root, padding=18)
-        outer.pack(fill="both", expand=True)
-
-        title = ttk.Label(
-            outer,
-            text="小米早安画报下载器",
-            font=("Microsoft YaHei UI", 18, "bold"),
-        )
-        title.pack(anchor="w")
         ttk.Label(
-            outer,
-            text="基于小米画报 25200033-CAROUSEL 的早安历史接口",
-        ).pack(anchor="w", pady=(2, 16))
+            container,
+            text="小米早安画报下载器",
+            font=("Microsoft YaHei UI", 21, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            container,
+            text="历史画报批量下载 · 高清地址自动尝试 · 日期/标题自定义命名",
+        ).pack(anchor="w", pady=(3, 16))
 
-        form = ttk.LabelFrame(outer, text="下载范围与保存设置", padding=14)
-        form.pack(fill="x")
+        cards = self._frame(container)
+        cards.pack(fill="x")
+        cards.columnconfigure(0, weight=1)
+        cards.columnconfigure(1, weight=1)
 
-        ttk.Label(form, text="开始日期").grid(row=0, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.start_var, width=18).grid(
-            row=1, column=0, sticky="ew", padx=(0, 12)
+        range_card = self._labelframe(cards, text="下载范围", padding=16)
+        range_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        save_card = self._labelframe(cards, text="保存设置", padding=16)
+        save_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        ttk.Label(range_card, text="开始日期（可留空）").grid(row=0, column=0, sticky="w")
+        ttk.Label(range_card, text="结束日期").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Entry(range_card, textvariable=self.start_var).grid(row=1, column=0, sticky="ew")
+        ttk.Entry(range_card, textvariable=self.end_var).grid(row=1, column=1, sticky="ew", padx=(12, 0))
+        ttk.Label(range_card, text="图片质量").grid(row=2, column=0, sticky="w", pady=(14, 0))
+        self._combo(range_card, self.quality_var, list(QUALITY_OPTIONS)).grid(
+            row=3, column=0, sticky="ew"
         )
-        ttk.Label(form, text="结束日期").grid(row=0, column=1, sticky="w")
-        ttk.Entry(form, textvariable=self.end_var, width=18).grid(
-            row=1, column=1, sticky="ew", padx=(0, 12)
-        )
-        ttk.Label(form, text="回退图片宽度").grid(row=0, column=2, sticky="w")
-        ttk.Combobox(
-            form,
-            textvariable=self.width_var,
-            values=("1080", "1440", "2160"),
-            width=12,
-            state="readonly",
-        ).grid(row=1, column=2, sticky="ew")
+        ttk.Label(
+            range_card,
+            text="best 会依次尝试完整/高清地址和 2160/1440/1080 CDN 地址",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        range_card.columnconfigure(0, weight=1)
+        range_card.columnconfigure(1, weight=1)
 
-        ttk.Label(form, text="保存目录").grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(12, 0)
+        ttk.Label(save_card, text="保存目录").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Entry(save_card, textvariable=self.output_var).grid(row=1, column=0, sticky="ew")
+        self._button(
+            save_card, "选择目录", self._browse, "secondary-outline"
+        ).grid(row=1, column=1, padx=(10, 0))
+        ttk.Label(save_card, text="图片名格式").grid(row=2, column=0, sticky="w", pady=(14, 0))
+        self._combo(save_card, self.filename_var, list(FILENAME_FORMATS)).grid(
+            row=3, column=0, sticky="ew"
         )
-        ttk.Entry(form, textvariable=self.output_var).grid(
-            row=3, column=0, columnspan=2, sticky="ew", padx=(0, 12)
-        )
-        ttk.Button(form, text="选择目录", command=self._browse).grid(
-            row=3, column=2, sticky="ew"
-        )
+        ttk.Label(
+            save_card,
+            text="date=日期 · title=标题 · date_title=日期+标题",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        save_card.columnconfigure(0, weight=1)
 
-        checks = ttk.Frame(form)
-        checks.grid(row=4, column=0, columnspan=3, sticky="w", pady=(14, 0))
-        ttk.Checkbutton(
-            checks, text="按 年/月 整理", variable=self.organize_var
-        ).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(
-            checks, text="保存 TXT 文案", variable=self.text_var
-        ).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(
-            checks, text="保存 JSON 元数据", variable=self.json_var
-        ).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(
-            checks, text="跳过已下载日期", variable=self.skip_var
-        ).pack(side="left")
+        opts = self._labelframe(container, text="其他选项", padding=14)
+        opts.pack(fill="x", pady=(14, 0))
+        row = self._frame(opts)
+        row.pack(fill="x")
+        for text, variable in (
+            ("按 年/月 整理", self.organize_var),
+            ("保存 TXT 文案", self.text_var),
+            ("保存 JSON 元数据", self.json_var),
+            ("跳过已下载", self.skip_var),
+            ("保存接口原始 JSON", self.debug_var),
+        ):
+            self._check(row, text, variable).pack(side="left", padx=(0, 16))
 
-        ttk.Checkbutton(
-            form,
-            text="调试：保存接口原始 JSON",
-            variable=self.debug_var,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
-
-        for col in range(3):
-            form.columnconfigure(col, weight=1)
-
-        actions = ttk.Frame(outer)
-        actions.pack(fill="x", pady=14)
-        self.start_button = ttk.Button(
-            actions, text="开始下载", command=self._start
-        )
+        actions = self._frame(container)
+        actions.pack(fill="x", pady=(14, 10))
+        self.start_button = self._button(actions, "开始下载", self._start, "success", width=14)
         self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(
-            actions, text="停止", command=self._stop, state="disabled"
+        self.stop_button = self._button(
+            actions, "停止", self._stop, "danger-outline", width=10, state="disabled"
         )
         self.stop_button.pack(side="left", padx=(10, 0))
+        self.scan_button = self._button(
+            actions, "仅扫描 1 页", self._scan_one_page, "info-outline", width=12
+        )
+        self.scan_button.pack(side="left", padx=(10, 0))
         ttk.Label(actions, textvariable=self.status_var).pack(side="right")
 
-        log_frame = ttk.LabelFrame(outer, text="运行日志", padding=8)
-        log_frame.pack(fill="both", expand=True)
+        self.progressbar = ttk.Progressbar(
+            container,
+            variable=self.progress_var,
+            maximum=100,
+        )
+        self.progressbar.pack(fill="x", pady=(0, 10))
 
-        self.log = self.tk.Text(
-            log_frame,
+        log_card = self._labelframe(container, text="运行日志", padding=10)
+        log_card.pack(fill="both", expand=True)
+        self.log = self.scrolledtext.ScrolledText(
+            log_card,
             height=18,
             wrap="word",
             font=("Consolas", 10),
-            state="disabled",
+            relief="flat",
+            bd=0,
         )
-        scroll = ttk.Scrollbar(log_frame, command=self.log.yview)
-        self.log.configure(yscrollcommand=scroll.set)
-        self.log.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        self.log.pack(fill="both", expand=True)
+        self.log.configure(state="disabled")
 
     def _browse(self) -> None:
         selected = self.filedialog.askdirectory(initialdir=self.output_var.get())
@@ -881,17 +1047,57 @@ class App:
             self.log.configure(state="disabled")
         self.root.after(100, self._flush_log_queue)
 
+    def _collect_params(self) -> tuple[date | None, date | None, Path]:
+        start = parse_date(self.start_var.get())
+        end = parse_date(self.end_var.get())
+        if start and end and start > end:
+            raise ValueError("开始日期不能晚于结束日期")
+        return start, end, Path(self.output_var.get()).expanduser()
+
+    def _scan_one_page(self) -> None:
+        if self.worker and self.worker.is_alive():
+            return
+        try:
+            start, end, output = self._collect_params()
+        except Exception as exc:
+            self.messagebox.showerror("参数错误", str(exc))
+            return
+
+        self._append_log("=" * 60)
+        self._append_log("仅扫描第一页，不下载图片。")
+
+        def worker() -> None:
+            try:
+                client = XiaomiPictorialClient(width=DEFAULT_WIDTH)
+                downloader = MorningDownloader(
+                    client,
+                    output_dir=output,
+                    organize_by_month=self.organize_var.get(),
+                    save_text=self.text_var.get(),
+                    save_json=self.json_var.get(),
+                    skip_existing=self.skip_var.get(),
+                    dry_run=True,
+                    quality_mode=self.quality_var.get(),
+                    filename_mode=self.filename_var.get(),
+                )
+                downloader.run(
+                    start_date=start,
+                    end_date=end,
+                    max_pages=1,
+                    debug_json=self.debug_var.get(),
+                    on_log=self._append_log,
+                )
+            except Exception as exc:
+                self._append_log(f"[错误] {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _start(self) -> None:
         if self.worker and self.worker.is_alive():
             return
 
         try:
-            start = parse_date(self.start_var.get())
-            end = parse_date(self.end_var.get())
-            if start and end and start > end:
-                raise ValueError("开始日期不能晚于结束日期")
-            width = int(self.width_var.get())
-            output = Path(self.output_var.get()).expanduser()
+            start, end, output = self._collect_params()
         except Exception as exc:
             self.messagebox.showerror("参数错误", str(exc))
             return
@@ -900,18 +1106,16 @@ class App:
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status_var.set("正在运行…")
+        self.progress_var.set(5)
         self._append_log("=" * 60)
         self._append_log(
-            f"范围：{start or '最早可获取'} ~ {end or '最新'} | 保存到：{output}"
+            f"范围：{start or '最早可获取'} ~ {end or '最新'} | "
+            f"质量：{self.quality_var.get()} | 命名：{self.filename_var.get()}"
         )
 
         def worker() -> None:
             try:
-                client = XiaomiPictorialClient(width=width)
-                self._append_log(
-                    f"接口参数：time_offset={client.time_offset}, "
-                    f"device_id={client.device_id[:8]}..."
-                )
+                client = XiaomiPictorialClient(width=DEFAULT_WIDTH)
                 downloader = MorningDownloader(
                     client,
                     output_dir=output,
@@ -919,16 +1123,20 @@ class App:
                     save_text=self.text_var.get(),
                     save_json=self.json_var.get(),
                     skip_existing=self.skip_var.get(),
+                    quality_mode=self.quality_var.get(),
+                    filename_mode=self.filename_var.get(),
                 )
 
                 def progress(stats: DownloadStats) -> None:
+                    done = stats.downloaded + stats.skipped + stats.failed
+                    total = max(stats.matched, done, 1)
+                    percent = 10 + min(85, done / total * 85)
+                    self.root.after(0, lambda: self.progress_var.set(percent))
                     self.root.after(
                         0,
                         lambda: self.status_var.set(
-                            f"页 {stats.pages} | "
-                            f"下载 {stats.downloaded} | "
-                            f"跳过 {stats.skipped} | "
-                            f"失败 {stats.failed}"
+                            f"页 {stats.pages} | 下载 {stats.downloaded} | "
+                            f"跳过 {stats.skipped} | 失败 {stats.failed}"
                         ),
                     )
 
@@ -941,8 +1149,7 @@ class App:
                     should_stop=self.stop_event.is_set,
                 )
                 self._append_log(
-                    "任务结束："
-                    f"匹配 {stats.matched}，下载 {stats.downloaded}，"
+                    f"任务结束：下载 {stats.downloaded}，"
                     f"跳过 {stats.skipped}，失败 {stats.failed}"
                 )
             except Exception as exc:
@@ -965,10 +1172,8 @@ class App:
     def _finished(self) -> None:
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
-        if self.stop_event.is_set():
-            self.status_var.set("已停止")
-        else:
-            self.status_var.set("完成")
+        self.progress_var.set(0 if self.stop_event.is_set() else 100)
+        self.status_var.set("已停止" if self.stop_event.is_set() else "完成")
 
     def run(self) -> None:
         self.root.mainloop()
