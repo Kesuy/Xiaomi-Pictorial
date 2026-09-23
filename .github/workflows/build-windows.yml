@@ -50,6 +50,9 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Generate high-resolution app icons
+        run: python tools/generate_icon.py
+
       - name: Build EXE
         run: >
           pyinstaller
