@@ -3,9 +3,14 @@ from __future__ import annotations
 from datetime import datetime, time as dt_time, timedelta, timezone
 from io import BytesIO
 import json
+from pathlib import Path
+import sys
 import time
 
 from PIL import Image
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from xiaomi_pictorial import XiaomiPictorialClient, extract_morning_records, _as_dict, _https
 
