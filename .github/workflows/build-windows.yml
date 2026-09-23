@@ -1,0 +1,109 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile check
+        run: python -m py_compile xiaomi_pictorial.py
+
+  build:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE
+        run: >
+          pyinstaller
+          --noconfirm
+          --clean
+          --onefile
+          --windowed
+          --name Xiaomi-Pictorial
+          --icon assets/app_icon.ico
+          --add-data "assets/app_icon.png;assets"
+          --add-data "assets/app_icon.ico;assets"
+          xiaomi_pictorial.py
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xiaomi-Pictorial-Windows
+          path: dist/Xiaomi-Pictorial.exe
+          if-no-files-found: error
+
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Xiaomi-Pictorial-Windows
+          path: release
+
+      - name: Publish Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v0.2.0"
+          $title = "Xiaomi Pictorial v0.2.0"
+          $notes = @"
+          首个正式发布版本。
+
+          - 现代扁平 GUI
+          - 小米早安画报历史批量下载
+          - 图片质量支持 best / 2160 / 1440 / 1080 自动尝试
+          - 支持 日期 / 标题 / 日期+标题 三种文件名格式
+          - 扁平风应用图标
+          - TXT/JSON 元数据、断点跳过与失败重试
+          "@
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag release/Xiaomi-Pictorial.exe --target "${{ github.sha }}" --title $title --notes $notes --latest
+          } else {
+            gh release upload $tag release/Xiaomi-Pictorial.exe --clobber
+          }
