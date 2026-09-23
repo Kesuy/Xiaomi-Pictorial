@@ -72,6 +72,7 @@ jobs:
           name: Xiaomi-Pictorial-Windows
           path: dist/Xiaomi-Pictorial.exe
           if-no-files-found: error
+          retention-days: 1
 
 
   release:
