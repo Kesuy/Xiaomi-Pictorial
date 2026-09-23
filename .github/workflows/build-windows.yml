@@ -92,17 +92,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          $tag = "v0.2.0"
-          $title = "Xiaomi Pictorial v0.2.0"
+          $tag = "v0.2.1"
+          $title = "Xiaomi Pictorial v0.2.1"
           $notes = @"
-          首个正式发布版本。
+          v0.2.1 修复与体验改进。
 
-          - 现代扁平 GUI
-          - 小米早安画报历史批量下载
-          - 图片质量支持 best / 2160 / 1440 / 1080 自动尝试
-          - 支持 日期 / 标题 / 日期+标题 三种文件名格式
-          - 扁平风应用图标
-          - TXT/JSON 元数据、断点跳过与失败重试
+          - 修复 EXE / 标题栏图标显示与清晰度
+          - 使用 1024×1024 源图生成多尺寸 Windows ICO
+          - xiaomi-pictorial.json 持久化保存路径、日期、图片质量、命名格式及所有开关
+          - 启动时自动恢复上次配置和窗口大小
+          - 保留 device_id 配置
+          - 继续保留早安画报历史批量下载、断点跳过与失败重试
           "@
 
           gh release view $tag *> $null
