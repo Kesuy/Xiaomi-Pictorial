@@ -1,66 +1,55 @@
 from __future__ import annotations
 
+from io import BytesIO
 import json
 from pathlib import Path
 import sys
+
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from xiaomi_pictorial import XiaomiPictorialClient, _as_dict
+from xiaomi_pictorial import XiaomiPictorialClient
 
 client = XiaomiPictorialClient(width=1200, time_offset=28800)
+locator = "ThemeMarket/0312f3e3d92524f0598f3a2b0a55020e4db505a2a"
+base = "https://wallpaper.cdn.pandora.xiaomi.com"
 
-CASES = [
-    ("morning", "/gallery/gallery_morning", {"time_offset": 28800}),
-    (
-        "morning_list",
-        "/gallery/gallery_morning_list",
-        {"time_offset": 28800, "start_time": 0, "delta": 6, "page_size": 30},
-    ),
-    (
-        "morning_history",
-        "/gallery/gallery_morning_history",
-        {"time_offset": 28800, "start_time": 0, "delta": 6, "page_size": 30},
-    ),
+urls = [
+    f"{base}/{locator}",
+    f"{base}/original/{locator}",
+    f"{base}/origin/{locator}",
+    f"{base}/full/{locator}",
+    f"{base}/image/{locator}",
+    f"{base}/thumbnail/{locator}",
+    f"{base}/thumbnail/webp/w0/{locator}",
+    f"{base}/webp/w1080/{locator}",
+    f"{base}/thumbnail/webp/w1080/{locator}",
 ]
 
-
-def walk(node, found):
-    if isinstance(node, dict):
-        cl = _as_dict(node.get("cl_url") or node.get("clUrl"))
-        if cl:
-            found.append(cl)
-        for value in node.values():
-            walk(value, found)
-    elif isinstance(node, list):
-        for value in node:
-            walk(value, found)
-
-
-for name, path, params in CASES:
-    print("CASE_BEGIN", name)
+for url in urls:
     try:
-        payload = client._get(path, params)
+        r = client.session.get(url, timeout=45)
+        dims = None
+        if r.ok:
+            try:
+                img = Image.open(BytesIO(r.content))
+                dims = [img.width, img.height]
+            except Exception:
+                pass
+        print("CANDIDATE", json.dumps({
+            "url": url,
+            "status": r.status_code,
+            "bytes": len(r.content),
+            "content_type": r.headers.get("Content-Type"),
+            "dims": dims,
+            "location": r.headers.get("Location"),
+        }, ensure_ascii=False))
     except Exception as exc:
-        print("CASE_ERROR", name, repr(exc))
-        continue
-
-    blocks = []
-    walk(payload, blocks)
-    print("CL_COUNT", name, len(blocks))
-    seen = set()
-    for block in blocks:
-        key = json.dumps(block, ensure_ascii=False, sort_keys=True)
-        if key in seen:
-            continue
-        seen.add(key)
-        print("CL_BLOCK", name, key)
-
-    Path(f"probe_{name}.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    print("CASE_END", name)
+        print("CANDIDATE", json.dumps({
+            "url": url,
+            "error": repr(exc),
+        }, ensure_ascii=False))
