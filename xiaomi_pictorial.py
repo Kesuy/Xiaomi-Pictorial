@@ -908,8 +908,8 @@ class App:
         self.root.after(100, self._flush_log_queue)
         # ttkbootstrap/Windows 可能在窗口初始化阶段重置图标，延迟再设置一次。
         self.root.after(150, self._set_icon)
-        # 旧版 JSON 只有 device_id 时，启动后立即补齐完整配置。
-        self._save_ui_config()
+        # 等窗口真正完成布局后再写入 geometry，避免首次启动保存成 1x1。
+        self.root.after(500, self._save_ui_config)
 
     def _resource_path(self, *parts: str) -> Path:
         base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
