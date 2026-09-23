@@ -173,7 +173,7 @@ def dedupe_keep_order(items: Iterable[str]) -> list[str]:
 
 
 def width_from_url(url: str) -> int:
-    match = re.search(r"/w(\\d{3,5})/", url)
+    match = re.search(r"/w(\d{3,5})/", url)
     return int(match.group(1)) if match else 0
 
 
