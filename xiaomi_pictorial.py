@@ -20,7 +20,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 APP_NAME = "Xiaomi Pictorial"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 API_HOST = "https://w.pandora.xiaomi.com"
 API_PREFIX = "/api/a1"
@@ -850,20 +850,50 @@ class App:
             self.use_bootstrap = False
 
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        self.root.geometry("980x760")
         self.root.minsize(920, 700)
+
+        self.config = load_config()
+        self.settings = self.config.get("settings", {})
+        if not isinstance(self.settings, dict):
+            self.settings = {}
+
+        geometry = str(self.settings.get("window_geometry") or "980x760")
+        self.root.geometry(geometry)
         self._set_icon()
 
-        self.start_var = tk.StringVar(value="")
-        self.end_var = tk.StringVar(value=date.today().isoformat())
-        self.output_var = tk.StringVar(value=str((_app_dir() / "downloads").resolve()))
-        self.quality_var = tk.StringVar(value="best")
-        self.filename_var = tk.StringVar(value="date")
-        self.organize_var = tk.BooleanVar(value=True)
-        self.text_var = tk.BooleanVar(value=True)
-        self.json_var = tk.BooleanVar(value=True)
-        self.skip_var = tk.BooleanVar(value=True)
-        self.debug_var = tk.BooleanVar(value=False)
+        self.start_var = tk.StringVar(
+            value=str(self.settings.get("start_date") or "")
+        )
+        self.end_var = tk.StringVar(
+            value=str(self.settings.get("end_date") or date.today().isoformat())
+        )
+        self.output_var = tk.StringVar(
+            value=str(
+                self.settings.get("output_dir")
+                or (_app_dir() / "downloads").resolve()
+            )
+        )
+        self.quality_var = tk.StringVar(
+            value=str(self.settings.get("quality") or "best")
+        )
+        self.filename_var = tk.StringVar(
+            value=str(self.settings.get("filename_format") or "date")
+        )
+        self.organize_var = tk.BooleanVar(
+            value=bool(self.settings.get("organize_by_month", True))
+        )
+        self.text_var = tk.BooleanVar(
+            value=bool(self.settings.get("save_text", True))
+        )
+        self.json_var = tk.BooleanVar(
+            value=bool(self.settings.get("save_json", True))
+        )
+        self.skip_var = tk.BooleanVar(
+            value=bool(self.settings.get("skip_existing", True))
+        )
+        self.debug_var = tk.BooleanVar(
+            value=bool(self.settings.get("debug_json", False))
+        )
         self.status_var = tk.StringVar(value="就绪")
         self.progress_var = tk.DoubleVar(value=0)
 
@@ -871,8 +901,15 @@ class App:
         self.worker: threading.Thread | None = None
         self.log_queue: queue.Queue[str] = queue.Queue()
 
+        self._config_save_job = None
         self._build()
+        self._bind_config_persistence()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._flush_log_queue)
+        # ttkbootstrap/Windows 可能在窗口初始化阶段重置图标，延迟再设置一次。
+        self.root.after(150, self._set_icon)
+        # 旧版 JSON 只有 device_id 时，启动后立即补齐完整配置。
+        self._save_ui_config()
 
     def _resource_path(self, *parts: str) -> Path:
         base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -883,6 +920,7 @@ class App:
             ico = self._resource_path("assets", "app_icon.ico")
             if ico.exists():
                 self.root.iconbitmap(default=str(ico))
+                self.root.wm_iconbitmap(str(ico))
         except Exception:
             pass
         try:
@@ -892,6 +930,54 @@ class App:
                 self.root.iconphoto(True, self._icon_ref)
         except Exception:
             pass
+
+    def _bind_config_persistence(self) -> None:
+        for variable in (
+            self.start_var,
+            self.end_var,
+            self.output_var,
+            self.quality_var,
+            self.filename_var,
+            self.organize_var,
+            self.text_var,
+            self.json_var,
+            self.skip_var,
+            self.debug_var,
+        ):
+            variable.trace_add("write", self._schedule_config_save)
+
+    def _schedule_config_save(self, *_args) -> None:
+        if self._config_save_job is not None:
+            try:
+                self.root.after_cancel(self._config_save_job)
+            except Exception:
+                pass
+        self._config_save_job = self.root.after(250, self._save_ui_config)
+
+    def _save_ui_config(self) -> None:
+        self._config_save_job = None
+        config = load_config()
+        config["settings"] = {
+            "start_date": self.start_var.get().strip(),
+            "end_date": self.end_var.get().strip(),
+            "output_dir": self.output_var.get().strip(),
+            "quality": self.quality_var.get().strip() or "best",
+            "filename_format": self.filename_var.get().strip() or "date",
+            "organize_by_month": bool(self.organize_var.get()),
+            "save_text": bool(self.text_var.get()),
+            "save_json": bool(self.json_var.get()),
+            "skip_existing": bool(self.skip_var.get()),
+            "debug_json": bool(self.debug_var.get()),
+            "window_geometry": self.root.geometry(),
+        }
+        config["app_version"] = APP_VERSION
+        save_config(config)
+        self.config = config
+        self.settings = config["settings"]
+
+    def _on_close(self) -> None:
+        self._save_ui_config()
+        self.root.destroy()
 
     def _frame(self, parent, **kwargs):
         return self.tb.Frame(parent, **kwargs) if self.use_bootstrap else self.ttk.Frame(parent, **kwargs)
@@ -1031,6 +1117,7 @@ class App:
         selected = self.filedialog.askdirectory(initialdir=self.output_var.get())
         if selected:
             self.output_var.set(selected)
+            self._save_ui_config()
 
     def _append_log(self, message: str) -> None:
         self.log_queue.put(message)
@@ -1052,6 +1139,7 @@ class App:
         end = parse_date(self.end_var.get())
         if start and end and start > end:
             raise ValueError("开始日期不能晚于结束日期")
+        self._save_ui_config()
         return start, end, Path(self.output_var.get()).expanduser()
 
     def _scan_one_page(self) -> None:
