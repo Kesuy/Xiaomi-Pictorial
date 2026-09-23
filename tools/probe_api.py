@@ -39,3 +39,12 @@ for image in images:
         root = _https(root).rstrip("/")
         for width in (1080, 1200, 2160):
             print("CDN_URL", width, f"{root}/webp/w{width}/{locator}")
+
+# Save the 1080 CDN rendition as an artifact for offline comparison.
+root = "https://wallpaper.cdn.pandora.xiaomi.com/thumbnail"
+locator = "ThemeMarket/0312f3e3d92524f0598f3a2b0a55020e4db505a2a"
+url = f"{root}/webp/w1080/{locator}"
+response = client.session.get(url, timeout=45)
+response.raise_for_status()
+Path("server_2026-09-22_1080.webp").write_bytes(response.content)
+print("SAVED_SERVER_IMAGE", len(response.content))
