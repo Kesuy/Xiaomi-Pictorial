@@ -87,6 +87,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           $tag = "v0.2.0"
           $title = "Xiaomi Pictorial v0.2.0"
