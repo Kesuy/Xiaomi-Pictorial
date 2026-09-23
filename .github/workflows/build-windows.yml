@@ -33,6 +33,11 @@ jobs:
       - name: Compile check
         run: python -m py_compile xiaomi_pictorial.py
 
+      - name: Probe live Xiaomi API
+        run: |
+          pip install pillow
+          python tools/probe_api.py
+
   build:
     needs: test
     runs-on: windows-latest
