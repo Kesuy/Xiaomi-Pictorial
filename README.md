@@ -80,3 +80,25 @@ date_title  -> 2026-09-23 早安世界.jpg
 ## 注意
 
 这是非官方工具。小米画报接口、历史数据保留时间和 CDN 分辨率可能随时调整，请控制请求频率，仅用于个人备份和研究。
+
+
+## 配置持久化
+
+Windows GUI 会在程序目录保存 `xiaomi-pictorial.json`。除稳定的 `device_id` 外，v0.2.1 起还会保存并自动恢复：
+
+- 开始/结束日期
+- 保存目录
+- 图片质量
+- 图片命名格式
+- 按年/月整理
+- 保存 TXT
+- 保存 JSON
+- 跳过已下载
+- 保存接口原始 JSON
+- 窗口大小
+
+## 关于手机保存出的 1200×2608
+
+APK 中 `MorningImageUrl.getHdUrl()` 会按设备屏幕宽度请求 CDN 图片；今天的服务端素材实测仍返回 1080×1920。
+但小米画报自己的 `SaveImageTask` 还会调用 `useScreenRatioSaveImgToExternalFolder()`，读取屏幕宽高、创建全屏 RelativeLayout/ImageView（CENTER_CROP）后再保存。
+因此手机看到的 1200×2608 是按手机屏幕比例重新生成的保存图，不等同于服务器存在 1200×2608 原始素材。
