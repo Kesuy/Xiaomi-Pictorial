@@ -1,60 +1,66 @@
 from __future__ import annotations
-from io import BytesIO
+
 import json
 from pathlib import Path
 import sys
-
-from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from xiaomi_pictorial import XiaomiPictorialClient
-
-locator = "ThemeMarket/0312f3e3d92524f0598f3a2b0a55020e4db505a2a"
-hosts = [
-    "wallpaper.cdn.pandora.xiaomi.com",
-    "image.pandora.xiaomi.com",
-    "gallery.cdn.pandora.xiaomi.com",
-    "package.wallpaper.cdn.pandora.xiaomi.com",
-]
-paths = [
-    "{locator}",
-    "original/{locator}",
-    "origin/{locator}",
-    "raw/{locator}",
-    "full/{locator}",
-    "image/{locator}",
-    "jpeg/{locator}",
-    "webp/{locator}",
-    "jpeg/w1200/{locator}",
-    "webp/w1200/{locator}",
-    "thumbnail/jpeg/w1200/{locator}",
-    "thumbnail/webp/w1200/{locator}",
-]
+from xiaomi_pictorial import XiaomiPictorialClient, _as_dict
 
 client = XiaomiPictorialClient(width=1200, time_offset=28800)
-for host in hosts:
-    for pat in paths:
-        url = "https://" + host + "/" + pat.format(locator=locator)
-        try:
-            r = client.session.get(url, timeout=15)
-            row = {
-                "url": url,
-                "status": r.status_code,
-                "type": r.headers.get("Content-Type"),
-                "bytes": len(r.content),
-            }
-            if r.ok and r.content:
-                try:
-                    im = Image.open(BytesIO(r.content))
-                    row["dims"] = [im.width, im.height]
-                    row["format"] = im.format
-                except Exception:
-                    pass
-            if r.status_code != 404 or "dims" in row:
-                print("CANDIDATE", json.dumps(row, ensure_ascii=False))
-        except Exception as exc:
-            print("ERROR", host, pat, type(exc).__name__, str(exc)[:160])
+
+CASES = [
+    ("morning", "/gallery/gallery_morning", {"time_offset": 28800}),
+    (
+        "morning_list",
+        "/gallery/gallery_morning_list",
+        {"time_offset": 28800, "start_time": 0, "delta": 6, "page_size": 30},
+    ),
+    (
+        "morning_history",
+        "/gallery/gallery_morning_history",
+        {"time_offset": 28800, "start_time": 0, "delta": 6, "page_size": 30},
+    ),
+]
+
+
+def walk(node, found):
+    if isinstance(node, dict):
+        cl = _as_dict(node.get("cl_url") or node.get("clUrl"))
+        if cl:
+            found.append(cl)
+        for value in node.values():
+            walk(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            walk(value, found)
+
+
+for name, path, params in CASES:
+    print("CASE_BEGIN", name)
+    try:
+        payload = client._get(path, params)
+    except Exception as exc:
+        print("CASE_ERROR", name, repr(exc))
+        continue
+
+    blocks = []
+    walk(payload, blocks)
+    print("CL_COUNT", name, len(blocks))
+    seen = set()
+    for block in blocks:
+        key = json.dumps(block, ensure_ascii=False, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        print("CL_BLOCK", name, key)
+
+    Path(f"probe_{name}.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print("CASE_END", name)
